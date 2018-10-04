@@ -1,296 +1,344 @@
-#include <algorithm>
+// ------------------------------------------------------------------
+// Project: Multi Person Parser
+// Written by Ruihe Qian
+// ------------------------------------------------------------------
+
 #include <cfloat>
+#include <iostream>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "caffe/layers/roi_align_layer.hpp"
-
+#include <algorithm>
+#include <stdlib.h>
+  
+#include "caffe/fast_rcnn_layers.hpp"
 
 using std::max;
 using std::min;
+using std::floor;
+using std::ceil;
+using std::cout;
 
 namespace caffe {
 
-	template <typename Dtype>
-	__global__ void ROIAlignForward(const int nthreads, const Dtype* bottom_data,
-		const Dtype spatial_scale, const int channels, const int height,
-		const int width, const int pooled_height, const int pooled_width,
-		const Dtype pad_ratio, const Dtype* bottom_rois, const int interpolate_times, Dtype* top_data, int* argmax_data, Dtype* w_data) {
-		CUDA_KERNEL_LOOP(index, nthreads) {
-			// (n, c, ph, pw) is an element in the pooled output
-			int pw = index % pooled_width;
-			int ph = (index / pooled_width) % pooled_height;
-			int c = (index / pooled_width / pooled_height) % channels;
-			int n = index / pooled_width / pooled_height / channels;
+template <typename Dtype>
+__device__ void bilinear_interpolate_gradient(
+    const int height,
+    const int width,
+    Dtype y,
+    Dtype x,
+    Dtype& w1,
+    Dtype& w2,
+    Dtype& w3,
+    Dtype& w4,
+    int& x_low,
+    int& x_high,
+    int& y_low,
+    int& y_high,
+    const int index /* index for debug only*/) {
+  // deal with cases that inverse elements are out of feature map boundary
+  if (y < -1.0 || y > height || x < -1.0 || x > width) {
+    // empty
+    w1 = w2 = w3 = w4 = 0.;
+    x_low = x_high = y_low = y_high = -1;
+    return;
+  }
 
-			bottom_rois += n * 5;
-			int roi_batch_ind = bottom_rois[0];
+  if (y <= 0) {
+    y = 0;
+  }
+  if (x <= 0) {
+    x = 0;
+  }
 
-			// padding
-			Dtype pad_w, pad_h;
-			pad_w = (bottom_rois[3] - bottom_rois[1] + 1)*pad_ratio;
-			pad_h = (bottom_rois[4] - bottom_rois[2] + 1)*pad_ratio;
-			Dtype roi_start_w = (bottom_rois[1] - pad_w) * spatial_scale;
-			Dtype roi_start_h = (bottom_rois[2] - pad_h) * spatial_scale;
-			Dtype roi_end_w = (bottom_rois[3] + pad_w) * spatial_scale;
-			Dtype roi_end_h = (bottom_rois[4] + pad_h) * spatial_scale;
-			// clipping
-			roi_start_w = max(roi_start_w, Dtype(0)); roi_start_h = max(roi_start_h, Dtype(0));
-			int img_width = round(width / spatial_scale);
-			int img_height = round(height / spatial_scale);
-			roi_end_w = min(Dtype(img_width - 1), roi_end_w);
-			roi_end_h = min(Dtype(img_height - 1), roi_end_h);
+  y_low = (int)y;
+  x_low = (int)x;
 
-			Dtype roi_height = max(roi_end_h - roi_start_h + 1, Dtype(1));
-			Dtype roi_width = max(roi_end_w - roi_start_w + 1, Dtype(1));
-			const Dtype bin_size_h = static_cast<Dtype>(roi_height)
-				/ static_cast<Dtype>(pooled_height);
-			const Dtype bin_size_w = static_cast<Dtype>(roi_width)
-				/ static_cast<Dtype>(pooled_width);
+  if (y_low >= height - 1) {
+    y_high = y_low = height - 1;
+    y = (Dtype)y_low;
+  } else {
+    y_high = y_low + 1;
+  }
 
-			bottom_data += (roi_batch_ind * channels + c) * height * width;
+  if (x_low >= width - 1) {
+    x_high = x_low = width - 1;
+    x = (Dtype)x_low;
+  } else {
+    x_high = x_low + 1;
+  }
 
-			double argmax_temp_data[4];
-			double w_temp_data[4];
-			double start_x = 0.25, start_y = 0.25;
-			if (interpolate_times == 1) {
-				start_x = 0.5;
-				start_y = 0.5;
-			}
-			Dtype dfValue = 0, maxValue = 0;
-			for (int inter_index = 0; inter_index < interpolate_times; ++inter_index) {
-				int index_x = inter_index / 2;
-				int index_y = inter_index % 2;
-				Dtype off_x = index_x * 0.5 + start_x;
-				Dtype off_y = index_y * 0.5 + start_y;
-				Dtype hcenter = static_cast<Dtype>(ph + off_x)* bin_size_h;
-				Dtype wcenter = static_cast<Dtype>(pw + off_y)* bin_size_w;
+  Dtype ly = y - y_low;
+  Dtype lx = x - x_low;
+  Dtype hy = 1. - ly, hx = 1. - lx;
 
-				hcenter = min(max(hcenter + roi_start_h, Dtype(0)), Dtype(height - 1));
-				wcenter = min(max(wcenter + roi_start_w, Dtype(0)), Dtype(width - 1));
+  // reference in forward
+  // T v1 = bottom_data[y_low * width + x_low];
+  // T v2 = bottom_data[y_low * width + x_high];
+  // T v3 = bottom_data[y_high * width + x_low];
+  // T v4 = bottom_data[y_high * width + x_high];
+  // T val = (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
 
-				int hstart = min(max(hcenter, Dtype(0)), Dtype(height - 1));
-				int wstart = min(max(wcenter, Dtype(0)), Dtype(width - 1));
-				int hend = min(max(hstart + 1, 0), height - 1);
-				int wend = min(max(wstart + 1, 0), width - 1);
+  w1 = hy * hx, w2 = hy * lx, w3 = ly * hx, w4 = ly * lx;
 
-				Dtype fX0 = wcenter - wstart;
-				Dtype fX1 = wend - wcenter;
-				Dtype fY0 = hcenter - hstart;
-				Dtype fY1 = hend - hcenter;
-				Dtype fFactorA = fY1 * fX1;
-				Dtype fFactorB = fY1 * fX0;
-				Dtype fFactorC = fY0 * fX1;
-				Dtype fFactorD = fY0 * fX0;
+  return;
+}
 
-				dfValue = bottom_data[hstart * width + wstart] * fFactorA
-					+ bottom_data[hstart * width + wend] * fFactorB
-					+ bottom_data[hend * width + wstart] * fFactorC
-					+ bottom_data[hend * width + wend] * fFactorD;
+template <typename Dtype>
+__device__ Dtype bilinear_interpolate(
+  const Dtype* bottom_data,
+  const int height,
+  const int width,
+  Dtype y,
+  Dtype x,
+  const int index /* index for debug only*/) {
+// deal with cases that inverse elements are out of feature map boundary
+if (y < -1.0 || y > height || x < -1.0 || x > width) {
+  // empty
+  return 0;
+}
 
-				if (inter_index == 0) {
-					maxValue = dfValue - 1;
-				}
+if (y <= 0) {
+  y = 0;
+}
+if (x <= 0) {
+  x = 0;
+}
 
-				argmax_temp_data[0] = hstart * width + wstart;
-				argmax_temp_data[1] = hstart * width + wend;
-				argmax_temp_data[2] = hend * width + wstart;
-				argmax_temp_data[3] = hend * width + wend;
+int y_low = (int)y;
+int x_low = (int)x;
+int y_high;
+int x_high;
 
-				w_temp_data[0] = fFactorA;
-				w_temp_data[1] = fFactorB;
-				w_temp_data[2] = fFactorC;
-				w_temp_data[3] = fFactorD;
+if (y_low >= height - 1) {
+  y_high = y_low = height - 1;
+  y = (Dtype)y_low;
+} else {
+  y_high = y_low + 1;
+}
 
-				if (dfValue > maxValue || inter_index == 0) {
-					maxValue = dfValue;
-					top_data[index] = dfValue;
-					for (int s = 0; s < 4; ++s) {
-						w_data[4 * index + s] = w_temp_data[s];
-						argmax_data[4 * index + s] = argmax_temp_data[s];
-					}
-				}
-			}
-		}
-	}
+if (x_low >= width - 1) {
+  x_high = x_low = width - 1;
+  x = (Dtype)x_low;
+} else {
+  x_high = x_low + 1;
+}
 
-	template <typename Dtype>
-	__global__ void ROICubicForward(const int nthreads, const Dtype* bottom_data,
-		const Dtype spatial_scale, const int channels, const int height,
-		const int width, const int pooled_height, const int pooled_width,
-		const Dtype pad_ratio, const Dtype* bottom_rois, const int interpolate_times, Dtype* top_data, int* argmax_data, Dtype* w_data) {
-		CUDA_KERNEL_LOOP(index, nthreads) {
-			// (n, c, ph, pw) is an element in the pooled output
-			int pw = index % pooled_width;
-			int ph = (index / pooled_width) % pooled_height;
-			int c = (index / pooled_width / pooled_height) % channels;
-			int n = index / pooled_width / pooled_height / channels;
+Dtype ly = y - y_low;
+Dtype lx = x - x_low;
+Dtype hy = 1. - ly, hx = 1. - lx;
+// do bilinear interpolation
+Dtype v1 = bottom_data[y_low * width + x_low];
+Dtype v2 = bottom_data[y_low * width + x_high];
+Dtype v3 = bottom_data[y_high * width + x_low];
+Dtype v4 = bottom_data[y_high * width + x_high];
+Dtype w1 = hy * hx, w2 = hy * lx, w3 = ly * hx, w4 = ly * lx;
 
-			bottom_rois += n * 5;
-			int roi_batch_ind = bottom_rois[0];
+Dtype val = (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
 
-			// padding
-			Dtype pad_w, pad_h;
-			pad_w = (bottom_rois[3] - bottom_rois[1] + 1)*pad_ratio;
-			pad_h = (bottom_rois[4] - bottom_rois[2] + 1)*pad_ratio;
-			Dtype roi_start_w = (bottom_rois[1] - pad_w) * spatial_scale;
-			Dtype roi_start_h = (bottom_rois[2] - pad_h) * spatial_scale;
-			Dtype roi_end_w = (bottom_rois[3] + pad_w) * spatial_scale;
-			Dtype roi_end_h = (bottom_rois[4] + pad_h) * spatial_scale;
-			// clipping
-			roi_start_w = max(roi_start_w, Dtype(0)); roi_start_h = max(roi_start_h, Dtype(0));
-			int img_width = round(width / spatial_scale);
-			int img_height = round(height / spatial_scale);
-			roi_end_w = min(Dtype(img_width - 1), roi_end_w);
-			roi_end_h = min(Dtype(img_height - 1), roi_end_h);
+return val;
+}
 
-			Dtype roi_height = max(roi_end_h - roi_start_h + 1, Dtype(1));
-			Dtype roi_width = max(roi_end_w - roi_start_w + 1, Dtype(1));
-			const Dtype bin_size_h = static_cast<Dtype>(roi_height)
-				/ static_cast<Dtype>(pooled_height);
-			const Dtype bin_size_w = static_cast<Dtype>(roi_width)
-				/ static_cast<Dtype>(pooled_width);
+template <typename Dtype>
+__global__ void ROIAlignForward(const int nthreads, const Dtype* bottom_data,
+    const Dtype spatial_scale, const int channels, const int height,
+    const int width, const int pooled_height, const int pooled_width,
+    const Dtype* bottom_rois, const Dtype* extended_rois,
+    Dtype* top_data) {
+    
+  CUDA_KERNEL_LOOP(index, nthreads) {
+    // (n, c, ph, pw) is an element in the pooled output
+    // 将1维连续坐标index转成输出map上的坐标(n, c, ph, pw)
+    int pw = index % pooled_width;
+    int ph = (index / pooled_width) % pooled_height;
+    int c = (index / pooled_width / pooled_height) % channels;
+    int n = index / pooled_width / pooled_height / channels;
 
-			bottom_data += (roi_batch_ind * channels + c) * height * width;
-			double argmax_temp_data[16];
-			double w_temp_data[16];
-			double start_x = 0.25, start_y = 0.25;
-			if (interpolate_times == 1) {
-				start_x = 0.5;
-				start_y = 0.5;
-			}
-			Dtype dfCubicValue = 0, maxValue = 0;
-			for (int inter_index = 0; inter_index < interpolate_times; ++inter_index) {
-				int index_x = inter_index / 2;
-				int index_y = inter_index % 2;
-				Dtype off_x = index_x * 0.5 + start_x;
-				Dtype off_y = index_y * 0.5 + start_y;
-				Dtype hcenter = static_cast<Dtype>(ph + off_x)* bin_size_h;
-				Dtype wcenter = static_cast<Dtype>(pw + off_y)* bin_size_w;
+    // 指向下一批输入ROI的起始指针处
+    const Dtype* offset_bottom_rois = bottom_rois + n * 5;
+    const Dtype* offset_extended_rois = extended_rois + n * 5;
+    int roi_batch_ind = bottom_rois[0];
+    // 将ROI在原图上的坐标映射到feature map上
+    // 注意这里不对坐标进行四舍五入了
+    Dtype roi_start_w = offset_extended_rois[1] * spatial_scale;  // include
+    Dtype roi_start_h = offset_extended_rois[2] * spatial_scale;
+    Dtype roi_end_w = offset_extended_rois[3] * spatial_scale;
+    Dtype roi_end_h = offset_extended_rois[4] * spatial_scale;
 
-				hcenter = min(max(hcenter + roi_start_h, Dtype(0)), Dtype(height - 1));
-				wcenter = min(max(wcenter + roi_start_w, Dtype(0)), Dtype(width - 1));
+    Dtype roi_width = max(roi_end_w - roi_start_w, (Dtype)1.);
+    Dtype roi_height = max(roi_end_h - roi_start_h, (Dtype)1.);
+    Dtype bin_size_h = static_cast<Dtype>(roi_height) / static_cast<Dtype>(pooled_height);
+    Dtype bin_size_w = static_cast<Dtype>(roi_width) / static_cast<Dtype>(pooled_width);
 
-				int i = wcenter;
-				int j = hcenter;
+    const Dtype* offset_bottom_data = bottom_data + (roi_batch_ind * channels + c) * height * width;
+  
+    int roi_bin_grid_h = (sampling_ratio > 0) ? sampling_ratio : ceil(roi_height / pooled_height);
+    int roi_bin_grid_w = (sampling_ratio > 0) ? sampling_ratio : ceil(roi_width / pooled_width);
 
-				/*get adjacent 16 values*/
-				double values[4][4];
-				int temp_c, temp_r;
-				for (int r = j - 1, s = 0; r <= j + 2; r++, s++){
-					for (int c = i - 1, t = 0; c <= i + 2; c++, t++){
-						//todo: ??16?,????
-						temp_c = min(max(Dtype(c), Dtype(0)), Dtype(width - 1));
-						temp_r = min(max(Dtype(r), Dtype(0)), Dtype(height - 1));
-						values[s][t] = bottom_data[temp_r*width + temp_c];
-						argmax_temp_data[s * 4 + t] = temp_r*width + temp_c;
-					}
-				}
+    const Dtype count = roi_bin_grid_h * roi_bin_grid_w;
+    Dtype output_val = 0;
+    for (int iy = 0; iy < roi_bin_grid_h; iy++) // e.g., iy = 0, 1
+    {
+      const Dtype y = roi_start_h + ph * bin_size_h +
+          static_cast<Dtype>(iy + .5f) * bin_size_h /
+              static_cast<Dtype>(roi_bin_grid_h); // e.g., 0.5, 1.5
+      for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+        const Dtype x = roi_start_w + pw * bin_size_w +
+            static_cast<Dtype>(ix + .5f) * bin_size_w /
+                static_cast<Dtype>(roi_bin_grid_w);
+                Dtype val = bilinear_interpolate(
+            offset_bottom_data, height, width, y, x, index);
+        output_val += val;
+      }
+    }
+    output_val /= count;
 
-				/*calc the coeff*/
-				double u = wcenter - i;
-				double v = hcenter - j;
-				double A[4], C[4];
-				for (int distance = 1, s = 0; distance >= -2; distance--, s++){
-					A[s] = cubic_coeff_gpu(u + distance);
-					C[s] = cubic_coeff_gpu(v + distance);
-				}
+    top_data[index] = output_val;
+  }
+}
 
-				dfCubicValue = 0;
-				for (int s = 0; s < 4; s++) {
-					for (int t = 0; t < 4; t++) {
-						dfCubicValue += values[s][t] * A[t] * C[s];
-						w_temp_data[s * 4 + t] = A[t] * C[s];
-					}
-				}
-				if (dfCubicValue > maxValue || inter_index == 0) {
-					maxValue = dfCubicValue;
-					top_data[index] = dfCubicValue;
-					for (int s = 0; s < 16; ++s) {
-						w_data[16 * index + s] = w_temp_data[s];
-						argmax_data[16 * index + s] = argmax_temp_data[s];
-					}
-				}
-			}
-		}
-	}
 
-	template <typename Dtype>
-	void ROIAlignLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
-		const vector<Blob<Dtype>*>& top) {
-		const Dtype* bottom_data = bottom[0]->gpu_data();
-		const Dtype* bottom_rois = bottom[1]->gpu_data();
-		//std::cout << "1 x,1 y "<< bottom[1]->cpu_data()[0] << "  " << bottom[1]->cpu_data()[1] << std::endl;
-		//std::cout << "1 width,1 height "<< bottom[1]->cpu_data()[2] << "  " << bottom[1]->cpu_data()[3] << std::endl;
-		Dtype* top_data = top[0]->mutable_gpu_data();
-		int* argmax_data = bili_idx.mutable_gpu_data();
-		Dtype* w_data = bili_w.mutable_gpu_data();
-		int count = top[0]->count();
-		int interpolate_times = is_multi_interpolate ? 4 : 1;
-		// NOLINT_NEXT_LINE(whitespace/operators)
-		if (bi_type == BiCubic) {
-			ROICubicForward<Dtype> << <CAFFE_GET_BLOCKS(count), CAFFE_CUDA_NUM_THREADS >> >(
-				count, bottom_data, spatial_scale_, channels_, height_, width_,
-				pooled_height_, pooled_width_, pad_ratio_, bottom_rois, interpolate_times, top_data, argmax_data, w_data);
-		}
-		else {
-			ROIAlignForward<Dtype> << <CAFFE_GET_BLOCKS(count), CAFFE_CUDA_NUM_THREADS >> >(
-				count, bottom_data, spatial_scale_, channels_, height_, width_,
-				pooled_height_, pooled_width_, pad_ratio_, bottom_rois, interpolate_times, top_data, argmax_data, w_data);
-		}
-		CUDA_POST_KERNEL_CHECK;
-	}
 
-	template <typename Dtype>
-	__global__ void ROIAlignBackward(const int nthreads, const Dtype* top_diff,
-		const int* argmax_data, const Dtype* w_data, const int num_rois, const Dtype spatial_scale,
-		const int channels, const int height, const int width,
-		const int pooled_height, const int pooled_width, const int w_num, const Dtype pad_ratio,
-		Dtype* bottom_diff, const Dtype* bottom_rois) {
-		CUDA_KERNEL_LOOP(index, nthreads) {
-			// (n, c, h, w) coords in bottom data
-			//int pw = index % pooled_width;
-			//int ph = (index / pooled_width) % pooled_height;
-			int c = (index / pooled_width / pooled_height) % channels;
-			int n = index / pooled_width / pooled_height / channels;
 
-			bottom_rois += n * 5;
-			int roi_batch_ind = bottom_rois[0];
 
-			for (int i = 0; i < w_num; ++i) {
-				if (argmax_data[w_num * index + i] >= 0) {
-					int offset_bottom = (roi_batch_ind * channels + c) * height
-						* width + argmax_data[w_num * index + i];
-					bottom_diff[offset_bottom] += top_diff[index] * w_data[w_num * index + i];
-				}
-			}
-		}
-	}
+template <typename Dtype>
+void ROIAlignLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->gpu_data();
+  const Dtype* bottom_rois = bottom[1]->gpu_data();
+  const Dtype* extended_rois = bottom[2]->gpu_data();
+  Dtype* top_data = top[0]->mutable_gpu_data();
+  int count = top[0]->count();
+  
+  // NOLINT_NEXT_LINE(whitespace/operators)
+  ROIAlignForward<Dtype><<<CAFFE_GET_BLOCKS(count), CAFFE_CUDA_NUM_THREADS>>>(
+      count, bottom_data, spatial_scale_, channels_, height_, width_,
+      pooled_height_, pooled_width_, bottom_rois, extended_rois, top_data);
+  CUDA_POST_KERNEL_CHECK;
 
-	template <typename Dtype>
-	void ROIAlignLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
-		const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
-		if (!propagate_down[0]) {
-			return;
-		}
-		const Dtype* bottom_rois = bottom[1]->gpu_data();
-		const Dtype* top_diff = top[0]->gpu_diff();
-		Dtype* bottom_diff = bottom[0]->mutable_gpu_diff();
-		const int count = bottom[0]->count();
-		caffe_gpu_set(count, Dtype(0.), bottom_diff);
-		const int* argmax_data = bili_idx.gpu_data();
-		const Dtype* w_data = bili_w.gpu_data();
-		const int top_count = top[0]->count();
-		int w_num = 4;
-		if (bi_type == BiCubic) {
-			w_num = 16;
-		}
-		// NOLINT_NEXT_LINE(whitespace/operators)
-		ROIAlignBackward<Dtype> << <CAFFE_GET_BLOCKS(top_count), CAFFE_CUDA_NUM_THREADS >> >(
-			top_count, top_diff, argmax_data, w_data, top[0]->num(), spatial_scale_, channels_,
-			height_, width_, pooled_height_, pooled_width_, w_num, pad_ratio_, bottom_diff, bottom_rois);
-		CUDA_POST_KERNEL_CHECK;
-	}
+}
 
-	INSTANTIATE_LAYER_GPU_FUNCS(ROIAlignLayer);
+template <typename Dtype>
+__global__ void ROIAlignBackward(const int nthreads, const Dtype* top_diff,
+    const int num_rois, const Dtype spatial_scale,
+    const int channels, const int height, const int width,
+    const int pooled_height, const int pooled_width, Dtype* bottom_diff,
+    const Dtype* bottom_rois, const Dtype* extended_rois) {
+    
+  CUDA_KERNEL_LOOP(index, nthreads) {
+    // (n, c, h, w) coords in bottom data
+    int w = index % width;
+    int h = (index / width) % height;
+    int c = (index / width / height) % channels;
+    int n = index / width / height / channels;
+
+    Dtype gradient = 0;
+    // Accumulate gradient over all ROIs that pooled this element
+    for (int roi_n = 0; roi_n < num_rois; ++roi_n) {
+      // offset_bottom_rois：用来遍历输入ROI的指针      
+      const Dtype* offset_bottom_rois = bottom_rois + roi_n * 5;
+      const Dtype* offset_extended_rois = extended_rois + roi_n * 5;      
+      
+      int roi_batch_ind = offset_bottom_rois[0];
+
+      Dtype roi_start_w = offset_extended_rois[1] * spatial_scale;  // include
+      Dtype roi_start_h = offset_extended_rois[2] * spatial_scale;
+      Dtype roi_end_w = offset_extended_rois[3] * spatial_scale;
+      Dtype roi_end_h = offset_extended_rois[4] * spatial_scale;
+
+      Dtype roi_width = max(roi_end_w - roi_start_w, (Dtype)1.);
+      Dtype roi_height = max(roi_end_h - roi_start_h, (Dtype)1.);
+      Dtype bin_size_h = static_cast<Dtype>(roi_height) / static_cast<Dtype>(pooled_height);
+      Dtype bin_size_w = static_cast<Dtype>(roi_width) / static_cast<Dtype>(pooled_width);
+
+      Dtype* offset_bottom_diff = bottom_diff + (roi_batch_ind * channels + c) * height * width;
+      int top_offset = (n * channels + c) * pooled_height * pooled_width;
+      const Dtype* offset_top_diff = top_diff + top_offset;
+      const Dtype top_diff_this_bin = offset_top_diff[ph * pooled_width + pw];
+
+      int roi_bin_grid_h = (sampling_ratio > 0) ? sampling_ratio : ceil(roi_height / pooled_height);
+      int roi_bin_grid_w =(sampling_ratio > 0) ? sampling_ratio : ceil(roi_width / pooled_width);
+
+      const Dtype count = roi_bin_grid_h * roi_bin_grid_w; // e.g. = 4
+      
+      for (int iy = 0; iy < roi_bin_grid_h; iy++) // e.g., iy = 0, 1
+      {
+        const Dtype y = roi_start_h + ph * bin_size_h +
+            static_cast<Dtype>(iy + .5f) * bin_size_h /
+                static_cast<Dtype>(roi_bin_grid_h); // e.g., 0.5, 1.5
+        for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+          const Dtype x = roi_start_w + pw * bin_size_w +
+              static_cast<Dtype>(ix + .5f) * bin_size_w /
+                  static_cast<Dtype>(roi_bin_grid_w);
+  
+          Dtype w1, w2, w3, w4;
+          int x_low, x_high, y_low, y_high;
+          bilinear_interpolate_gradient(
+              height,
+              width,
+              y,
+              x,
+              w1,
+              w2,
+              w3,
+              w4,
+              x_low,
+              x_high,
+              y_low,
+              y_high,
+              index);
+  
+          Dtype g1 = top_diff_this_bin * w1 / count;
+          Dtype g2 = top_diff_this_bin * w2 / count;
+          Dtype g3 = top_diff_this_bin * w3 / count;
+          Dtype g4 = top_diff_this_bin * w4 / count;
+  
+          if (x_low >= 0 && x_high >= 0 && y_low >= 0 && y_high >= 0) {
+            caffe_gpu_atomic_add(
+                static_cast<Dtype>(g1), offset_bottom_diff + y_low * width + x_low);
+            caffe_gpu_atomic_add(
+                static_cast<Dtype>(g2), offset_bottom_diff + y_low * width + x_high);
+            caffe_gpu_atomic_add(
+                static_cast<Dtype>(g3), offset_bottom_diff + y_high * width + x_low);
+            caffe_gpu_atomic_add(
+                static_cast<Dtype>(g4), offset_bottom_diff + y_high * width + x_high);
+          } // if
+        } // ix
+      } // iy
+    } // CUDA_1D_KERNEL_LOOP
+  } // RoIAlignBackward
+}
+
+
+
+
+template <typename Dtype>
+void ROIAlignLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  if (!propagate_down[0]) {
+    return;
+  }
+  const Dtype* bottom_rois = bottom[1]->gpu_data();
+  const Dtype* extended_rois = bottom[2]->gpu_data();
+    
+  const Dtype* top_diff = top[0]->gpu_diff();
+  Dtype* bottom_diff = bottom[0]->mutable_gpu_diff();
+  const int count = bottom[0]->count();
+  caffe_gpu_set(count, Dtype(0.), bottom_diff);
+  
+  // NOLINT_NEXT_LINE(whitespace/operators)
+  ROIAlignBackward<Dtype><<<CAFFE_GET_BLOCKS(count), CAFFE_CUDA_NUM_THREADS>>>(
+      count, top_diff, top[0]->num(), spatial_scale_, channels_,
+      height_, width_, pooled_height_, pooled_width_, bottom_diff, bottom_rois, extended_rois);
+  CUDA_POST_KERNEL_CHECK;
+    
+}
+
+
+
+INSTANTIATE_LAYER_GPU_FUNCS(ROIAlignLayer);
+
+
 
 }  // namespace caffe
